@@ -12,6 +12,11 @@ use std::sync::mpsc::channel;
 use std::str::Pattern;
 use std::sync::Arc;
 
+fn exchange<T>(a: &mut T, mut b: T) -> T {
+	std::mem::swap(a, &mut b);
+	b
+}
+
 struct BotConfig {
 	server: net::SocketAddr,
 	nick: &'static str,
@@ -27,7 +32,8 @@ struct BotContext<'a> {
 	conn: IrcWriter<'a>,
 	nick: Arc<String>,
 	logged_in: bool,
-	cfg: BotConfig
+	cfg: BotConfig,
+	poll: Option<(String, Vec<(String, u32)>)>
 }
 
 impl<'a> IrcWriter<'a> {
@@ -71,6 +77,14 @@ impl<'a> MessageContext<'a> {
 		}
 	}
 
+	fn reply_private(&self, conn: &mut IrcWriter, text: &str) {
+		conn.write_msg(irc::Notify(irc::TargetList::from_str(self.sender), text));
+	}
+
+	fn get_sender_nick(&self) -> &'a str {
+		self.sender
+	}
+
 	fn new(sender: &'a str, targets: irc::TargetList<'a>, ctx: &BotContext) -> MessageContext<'a> {
 		MessageContext {targets: targets, sender: irc::nick_from_mask(sender), nick: ctx.nick.clone()}
 	}
@@ -81,6 +95,68 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 	let (verb, args) = cmd2.find(|c:char| c.is_whitespace()).map_or_else(|| (cmd2.trim_right(), ""),
 								|p| (&cmd2[..p], cmd2[(p+1)..].trim()));
 	match verb {
+		"poll" => {
+			if ctx.poll != None {
+				let error = format!("A poll is already running. End it with {}endpoll", ctx.cfg.cmd_prefix);
+				msg_ctx.reply(&mut ctx.conn, &error[..]);
+				return true;
+			}
+			let mut parts = args.split('|').map(|s| s.trim());
+			let question = match parts.next() {
+				None | Some("") => {msg_ctx.reply(&mut ctx.conn, "usage: poll question|answer1|answer2|answer3 ..."); return true},
+				Some(s) => s.to_string()
+			};
+			let mut answers: Vec<_> = parts.map(|a| (a.to_string(), 0)).collect();
+			if answers.len() == 0 {
+				answers.push(("me".to_string(), 0));
+			}
+			let qmsg = format!("{} started a poll for: {}", msg_ctx.get_sender_nick(), question);
+			ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &qmsg[..]));
+			let mut count = 0;
+			for &(ref ans, _) in &answers {
+				count += 1;
+				let amsg = format!("/msg {} {}vote {} for: {}", ctx.nick, ctx.cfg.cmd_prefix, count, &ans[..]);
+				ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &amsg[..]));
+			}
+			ctx.poll = Some((question, answers));
+		},
+		"vote" => {
+			match ctx.poll {None => {
+				msg_ctx.reply(&mut ctx.conn, "no poll is running");
+			}, Some((_, ref mut answers)) => {
+				let len = answers.len();
+				let id = if args == "" {1} else { match args.trim().parse() {Ok(x) => x, Err(e) => {
+					msg_ctx.reply_private(&mut ctx.conn, &format!("argument must be an integer in range 1-{}", len));
+					return true;
+				}}};
+				match answers.get_mut(id - 1) {None => {
+					let error = format!("there are only {} answers, can't vote for no. {}", len, id);
+					msg_ctx.reply_private(&mut ctx.conn, &error[..]);
+				}, Some(&mut (ref ans, ref mut votes)) => {
+					*votes += 1;
+					let msg = format!("cast vote for: {}", &ans[..]);
+					msg_ctx.reply_private(&mut ctx.conn, &msg[..]);
+				}}
+			}}
+		},
+		"endpoll" => {
+			match exchange(&mut ctx.poll, None) {None => {
+				msg_ctx.reply(&mut ctx.conn, "no poll is running");
+			}, Some((question, answers)) => {
+				let total_votes = answers.iter().map(|&(_, votes)| votes).fold(0, |a,b|a+b);
+				if total_votes == 0 {
+					ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &format!("no votes were cast regarding: {}", question)));
+					return true;
+				}
+				ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &format!("Poll results for: {}", question)));
+				if answers.len() > 1 {for (answer, votes) in answers {
+					ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &format!("{}/{} = {}% of votes for: {}", votes,
+					total_votes, 100.0*(votes as f32)/(total_votes as f32), answer)));
+				}} else {
+					ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &format!("{} voted: {}", total_votes, answers[0].0)));
+				}
+			}}
+		},
 		"say" => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, args)),
 		"roll" => {
 			let (num_dice, num_sides) = args.find('d').map_or_else(|| (args, "6"), |p| (&args[..p], &args[(p+1)..]));
@@ -117,7 +193,7 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 			if irc::nick_from_mask(client) == ctx.cfg.nick {
 				for chan in list.iter() {
 					let msg = format!("Hello, {channel}!", channel=chan);
-					ctx.conn.write_msg(Talk(TargetList::from_str(chan), "Whatever you $say, my child ..."));
+					ctx.conn.write_msg(Talk(TargetList::from_str(chan), "How about a little $poll?"));
 				}
 			}
 			true
@@ -149,7 +225,7 @@ fn bot(cfg: BotConfig) {
 	let mut write = IrcWriter{conn: &mut conn};
 	write.write_msg(irc::SetNick(cfg.nick));
 	write.write_msg(irc::Register(cfg.user, cfg.real_name));
-	let mut ctx = BotContext {conn: write, nick: Arc::new(cfg.nick.to_string()), logged_in: false, cfg: cfg};
+	let mut ctx = BotContext {conn: write, nick: Arc::new(cfg.nick.to_string()), logged_in: false, cfg: cfg, poll: None};
 	loop {
 		select! {
 			m = rx.recv() => match m.unwrap() { Ok(s) => {
