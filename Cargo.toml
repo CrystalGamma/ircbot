@@ -1,0 +1,11 @@
+[package]
+
+name = "ircbot"
+version = "0.0.1"
+authors = ["Jona Stubbe (CrystalGamma) <dev@jona-stubbe.de>"]
+
+[dependencies]
+rand = "0.2.0"
+
+[dependencies.irc]
+path = "../irc"
