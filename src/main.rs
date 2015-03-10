@@ -1,16 +1,22 @@
 #![feature(io)]
 #![feature(net)]
 #![feature(std_misc)]
+#![feature(core)]
+#![feature(path)]
 extern crate irc;
 extern crate rand;
 use rand::Rng;
+extern crate hyper;
+extern crate "rustc-serialize" as serialize;
+use serialize::json::Json;
 
 use std::io::prelude::*;
 use std::net;
 use std::thread;
-use std::sync::mpsc::channel;
+use std::sync::mpsc::{channel, Sender};
 use std::str::Pattern;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 fn exchange<T>(a: &mut T, mut b: T) -> T {
 	std::mem::swap(a, &mut b);
@@ -33,7 +39,8 @@ struct BotContext<'a> {
 	nick: Arc<String>,
 	logged_in: bool,
 	cfg: BotConfig,
-	poll: Option<(String, Vec<(String, u32)>)>
+	poll: Option<(String, Vec<(String, u32)>)>,
+	stream_events_tx: Option<Sender<String>>
 }
 
 impl<'a> IrcWriter<'a> {
@@ -112,10 +119,8 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 			}
 			let qmsg = format!("{} started a poll for: {}", msg_ctx.get_sender_nick(), question);
 			ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &qmsg[..]));
-			let mut count = 0;
-			for &(ref ans, _) in &answers {
-				count += 1;
-				let amsg = format!("/msg {} {}vote {} for: {}", ctx.nick, ctx.cfg.cmd_prefix, count, &ans[..]);
+			for (count, &(ref ans, _)) in answers.iter().enumerate() {
+				let amsg = format!("/msg {} {}vote {} for: {}", ctx.nick, ctx.cfg.cmd_prefix, count + 1, &ans[..]);
 				ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &amsg[..]));
 			}
 			ctx.poll = Some((question, answers));
@@ -175,6 +180,55 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 	true
 }
 
+fn get_twitch_status<C: hyper::net::NetworkConnector>(http: &mut hyper::Client<C>, name: &str) -> Result<bool, String> {
+	http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..]).header(hyper::header::Accept(
+		vec![hyper::header::qitem("application/vnd.twitchtv.v3+json".parse().ok().expect("couldnt parse MIME type"))]
+	)).send().map_err(|_|"could not query api.twitch.tv".to_string()).and_then(|mut response| {
+		if response.status != hyper::Ok {return Err(format!("{}", response.status))}
+		let mut buf = String::new();
+		response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
+	}).and_then(|s| Json::from_str(&s[..]).map_err(|e| format!("{}", e))).and_then(|json|{
+		json.as_object().ok_or("Twitch API didn't return a JSON object".to_string()).and_then(|obj| obj.get("stream").ok_or(
+			"'stream' property missing in JSON document".to_string())).map(|obj| obj.is_object())
+	})
+}
+
+fn get_hitbox_status<C: hyper::net::NetworkConnector>(http: &mut hyper::Client<C>, name: &str) -> Result<bool, String> {
+	Err("dummy".to_string())
+}
+
+fn stream_map(dir: &str) -> HashMap<String, bool> {
+	match std::fs::read_dir(dir) {
+		Ok(rd) => rd.filter_map(|de| match de {
+			Ok(de) => de.path().file_name().and_then(|s| s.to_str()).map(|s| s.to_string()),
+			Err(_) => None
+		}).map(|s| (s, false)).collect(),
+		Err(_) => HashMap::new()
+	}
+}
+
+fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
+	use irc::*;
+	for chan in chan_list.iter() {
+		let msg = format!("Hello, {channel}!", channel=chan);
+		ctx.conn.write_msg(Talk(TargetList::from_str(chan), "How about a little $poll?"));
+	}
+	match exchange(&mut ctx.stream_events_tx, None) {None => {},Some(stream_events_tx) => {thread::spawn(move || {
+		let mut twitch: HashMap<String, bool> = stream_map("twitch");
+		stream_events_tx.send(format!("listening to twitch.tv streams: {:?}", twitch)).unwrap();
+		let mut client = hyper::Client::new();
+		loop {
+			for (stream, online) in twitch.iter_mut() {
+				match (online, get_twitch_status(&mut client, stream)) {
+					(_, Ok(true)) => stream_events_tx.send(format!("{} is online", stream)).unwrap(),
+					x@_ => stream_events_tx.send(format!("{} is offline: {:?}", stream, x)).unwrap()
+				}
+			}
+			std::thread::park_timeout(std::time::Duration::seconds(5))
+		}
+	});}};
+}
+
 fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 	use irc::*;
 	let semantic = analyse_message(msg);
@@ -191,10 +245,7 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 		},
 		Joined(client, list) => {
 			if irc::nick_from_mask(client) == ctx.cfg.nick {
-				for chan in list.iter() {
-					let msg = format!("Hello, {channel}!", channel=chan);
-					ctx.conn.write_msg(Talk(TargetList::from_str(chan), "How about a little $poll?"));
-				}
+				on_joined(list, ctx);
 			}
 			true
 		},
@@ -225,7 +276,15 @@ fn bot(cfg: BotConfig) {
 	let mut write = IrcWriter{conn: &mut conn};
 	write.write_msg(irc::SetNick(cfg.nick));
 	write.write_msg(irc::Register(cfg.user, cfg.real_name));
-	let mut ctx = BotContext {conn: write, nick: Arc::new(cfg.nick.to_string()), logged_in: false, cfg: cfg, poll: None};
+	let (stream_events_tx, stream_events) = channel();
+	let mut ctx = BotContext {
+		conn: write,
+		nick: Arc::new(cfg.nick.to_string()),
+		logged_in: false,
+		cfg: cfg,
+		poll: None,
+		stream_events_tx: Some(stream_events_tx)
+	};
 	loop {
 		select! {
 			m = rx.recv() => match m.unwrap() { Ok(s) => {
@@ -239,7 +298,8 @@ fn bot(cfg: BotConfig) {
 			}, Err(e) => {
 				println!("Recv error: {}", e);
 				break;
-			}}
+			}},
+			m = stream_events.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()))
 		}
 	}
 	irc_recv.join();
