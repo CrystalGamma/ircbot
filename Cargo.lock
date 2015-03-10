@@ -2,10 +2,19 @@
 name = "ircbot"
 version = "0.0.1"
 dependencies = [
+ "chrono 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "hyper 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "irc 0.0.1",
  "rand 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.1 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "chrono"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "time 0.1.19 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

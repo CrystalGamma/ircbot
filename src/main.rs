@@ -9,6 +9,7 @@ use rand::Rng;
 extern crate hyper;
 extern crate "rustc-serialize" as serialize;
 use serialize::json::Json;
+extern crate chrono;
 
 use std::io::prelude::*;
 use std::net;
@@ -189,7 +190,7 @@ enum Stream {
 use Stream::*;
 
 impl Stream {
-	fn get_status<C: hyper::net::NetworkConnector>(&self, http: &mut hyper::Client<C>) -> Result<bool, String> {
+	fn get_status<C: hyper::net::NetworkConnector>(&self, http: &mut hyper::Client<C>) -> Result<Option<chrono::DateTime<chrono::Local>>, String> {
 		match self {
 			&Twitch(ref name) => http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..])
 				.header(hyper::header::Accept(
@@ -204,7 +205,12 @@ impl Stream {
 					json.as_object().ok_or_else(||"Twitch API didn't return a JSON object".to_string())
 					.and_then(|obj| obj.get("stream").ok_or_else(
 						||"'stream' property missing in JSON document".to_string()))
-						.map(|obj| obj.is_object())
+						.and_then(|json| match json.as_object() {
+							Some(obj) => obj.get("created_at").ok_or_else(||"'created_at' property missing from stream status".to_string())
+								.and_then(|json| json.as_string().ok_or_else(||"'created_at' property of stream status is not a string".to_string()))
+								.and_then(|s| s.parse().map_err(|_|"could not parse stream start time".to_string()).map(|x|Some(x))),
+							None => Ok(None)
+						})
 				}),
 			&Hitbox(ref name) => http.get(&format!("http://api.hitbox.tv/media/live/{}", name)[..]).send()
 				.map_err(|e|format!("{}", e))
@@ -213,19 +219,19 @@ impl Stream {
 					let mut buf = String::new();
 					response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
 				}).and_then(|s|Json::from_str(&s[..]).map_err(|e|format!("{}",e)))
-				.and_then(|json: Json|{
-					json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string())
+				.and_then(
+					|json: Json|json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string())
 					.and_then(|obj| obj.get("livestream").ok_or_else(||"'livestream' property missing in JSON document".to_string()))
 					.and_then(|json|json.as_array().ok_or_else(||"'livestream' property is not an array".to_string()))
-					.and_then(|arr| arr.iter().fold(Ok(false),
-						|res, json: &Json| res.and_then(|online|if !online {
-							json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
+					.and_then(|arr| arr.iter().fold(Ok(None),
+						|res, json: &Json| res.and_then(|online|match online {
+							None => json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
 							.and_then(|obj| obj.get("media_is_live").ok_or_else(|| "one of the 'livestream' entries does not have a 'media_is_live' property".to_string()))
 							.and_then(|json: &Json|json.as_string().ok_or_else(|| "'media_is_live' is not a string in one of the 'livestream' entries".to_string())
-							.map(|s| &s[..] != "0"))
-						} else {Ok(true)})
-					))
-				})
+							.map(|s| None/*&s[..] != "0"*/)),
+							Some(x) => Ok(Some(x))
+						}
+					))))
 		}
 	}
 }
@@ -273,7 +279,7 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 				let new_status = stream.get_status(&mut client);
 				if new_status != *status {
 					match new_status {
-						Ok(online) => stream_events_tx.send((None, if online {
+						Ok(online) => stream_events_tx.send((None, if online != None {
 							format!("{:?} has gone on air!", stream)
 						} else {
 							format!("{:?} has gone offline", stream)
@@ -285,9 +291,9 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 			}
 		},
 		ListOnlineStreams(target) => {
-			for (stream, status) in streams.iter().filter(|(_, status)| status == Ok(true)) {
-				stream_events_tx.send((None, format!("Stream {:?} is online!", stream, msg.clone()))).unwrap()
-			}
+			for (stream, status) in streams.iter() {match *status {
+				Ok(Some(start)) => stream_events_tx.send((Some(target.clone()), format!("Stream {:?} is streaming since {}!", stream, start))).unwrap(),
+			_=>{}}}
 		}
 		_=>unimplemented!()}}
 	});}};
