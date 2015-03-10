@@ -13,7 +13,7 @@ use serialize::json::Json;
 use std::io::prelude::*;
 use std::net;
 use std::thread;
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, Sender, Receiver};
 use std::str::Pattern;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -40,7 +40,8 @@ struct BotContext<'a> {
 	logged_in: bool,
 	cfg: BotConfig,
 	poll: Option<(String, Vec<(String, u32)>)>,
-	stream_events_tx: Option<Sender<String>>
+	stream_requests: Sender<StreamListenerRequest>,
+	stream_resources: Option<(Sender<(Option<String>, String)>, Receiver<StreamListenerRequest>)>
 }
 
 impl<'a> IrcWriter<'a> {
@@ -130,7 +131,7 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 				msg_ctx.reply(&mut ctx.conn, "no poll is running");
 			}, Some((_, ref mut answers)) => {
 				let len = answers.len();
-				let id = if args == "" {1} else { match args.trim().parse() {Ok(x) => x, Err(e) => {
+				let id = if args == "" {1} else { match args.trim().parse() {Ok(x) => x, Err(_) => {
 					msg_ctx.reply_private(&mut ctx.conn, &format!("argument must be an integer in range 1-{}", len));
 					return true;
 				}}};
@@ -180,78 +181,115 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 	true
 }
 
-fn get_twitch_status<C: hyper::net::NetworkConnector>(http: &mut hyper::Client<C>, name: &str) -> Result<bool, String> {
-	http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..]).header(hyper::header::Accept(
-		vec![hyper::header::qitem("application/vnd.twitchtv.v3+json".parse().ok().expect("couldnt parse MIME type"))]
-	)).send().map_err(|_|"could not query api.twitch.tv".to_string()).and_then(|mut response| {
-		if response.status != hyper::Ok {return Err(format!("{}", response.status))}
-		let mut buf = String::new();
-		response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
-	}).and_then(|s| Json::from_str(&s[..]).map_err(|e| format!("{}", e))).and_then(|json|{
-		json.as_object().ok_or_else(||"Twitch API didn't return a JSON object".to_string()).and_then(|obj| obj.get("stream").ok_or_else(
-			||"'stream' property missing in JSON document".to_string())).map(|obj| obj.is_object())
-	})
+#[derive(PartialEq,Eq,Hash,Clone,Debug)]
+enum Stream {
+	Hitbox(String),
+	Twitch(String)
+}
+use Stream::*;
+
+impl Stream {
+	fn get_status<C: hyper::net::NetworkConnector>(&self, http: &mut hyper::Client<C>) -> Result<bool, String> {
+		match self {
+			&Twitch(ref name) => http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..])
+				.header(hyper::header::Accept(
+					vec![hyper::header::qitem("application/vnd.twitchtv.v3+json".parse().ok().expect("couldnt parse MIME type"))]
+				)).send().map_err(|_|"could not query api.twitch.tv".to_string())
+				.and_then(|mut response| {
+					if response.status != hyper::Ok {return Err(format!("{}", response.status))}
+					let mut buf = String::new();
+					response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
+				}).and_then(|s| Json::from_str(&s[..]).map_err(|e| format!("{}", e)))
+				.and_then(|json|{
+					json.as_object().ok_or_else(||"Twitch API didn't return a JSON object".to_string())
+					.and_then(|obj| obj.get("stream").ok_or_else(
+						||"'stream' property missing in JSON document".to_string()))
+						.map(|obj| obj.is_object())
+				}),
+			&Hitbox(ref name) => http.get(&format!("http://api.hitbox.tv/media/live/{}", name)[..]).send()
+				.map_err(|e|format!("{}", e))
+				.and_then(|mut response|{
+					if response.status != hyper::Ok {return Err(format!("{}", response.status))}
+					let mut buf = String::new();
+					response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
+				}).and_then(|s|Json::from_str(&s[..]).map_err(|e|format!("{}",e)))
+				.and_then(|json: Json|{
+					json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string())
+					.and_then(|obj| obj.get("livestream").ok_or_else(||"'livestream' property missing in JSON document".to_string()))
+					.and_then(|json|json.as_array().ok_or_else(||"'livestream' property is not an array".to_string()))
+					.and_then(|arr| arr.iter().fold(Ok(false),
+						|res, json: &Json| res.and_then(|online|if !online {
+							json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
+							.and_then(|obj| obj.get("media_is_live").ok_or_else(|| "one of the 'livestream' entries does not have a 'media_is_live' property".to_string()))
+							.and_then(|json: &Json|json.as_string().ok_or_else(|| "'media_is_live' is not a string in one of the 'livestream' entries".to_string())
+							.map(|s| &s[..] != "0"))
+						} else {Ok(true)})
+					))
+				})
+		}
+	}
 }
 
-fn get_hitbox_status<C: hyper::net::NetworkConnector>(http: &mut hyper::Client<C>, name: &str) -> Result<bool, String> {
-	http.get(&format!("http://api.hitbox.tv/media/live/{}", name)[..]).send().map_err(|e|format!("{}", e)).and_then(|mut response|{
-		if response.status != hyper::Ok {return Err(format!("{}", response.status))}
-		let mut buf = String::new();
-		response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
-	}).and_then(|s|Json::from_str(&s[..]).map_err(|e|format!("{}",e))).and_then(|json: Json|{
-		json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string()).and_then(|obj| obj.get("livestream").ok_or_else(
-			||"'livestream' property missing in JSON document".to_string())).and_then(|json|json.as_array().ok_or_else(
-			||"'livestream' property is not an array".to_string())).and_then(|arr| arr.iter().fold(Ok(false),
-				|res, json: &Json| res.and_then(|online|if !online {json.as_object().ok_or_else(
-					||"one of the 'livestream' entries is not a JSON object".to_string()).and_then(
-					|obj| obj.get("media_is_live").ok_or_else(
-					|| "one of the 'livestream' entries does not have a 'media_is_live' property".to_string())).and_then(
-					|json: &Json|json.as_string().ok_or_else(
-					|| "'media_is_live' is not a string in one of the 'livestream' entries".to_string()).map(
-					|s| &s[..] != "0"))} else {Ok(true)})
-		))
-	})
-}
-
-fn stream_map(dir: &str) -> HashMap<String, bool> {
+fn stream_map(dir: &str) -> Vec<String> {
 	match std::fs::read_dir(dir) {
 		Ok(rd) => rd.filter_map(|de| match de {
 			Ok(de) => de.path().file_name().and_then(|s| s.to_str()).map(|s| s.to_string()),
 			Err(_) => None
-		}).map(|s| (s, false)).collect(),
-		Err(_) => HashMap::new()
+		}).collect(),
+		Err(_) => Vec::new()
 	}
 }
+
+enum StreamListenerRequest {
+	ListOnlineStreams(String),
+	ListAllStreams(Option<String>),
+	UpdateStreams,
+	AddStream(Stream),
+	RemoveStream(Stream)
+}
+use StreamListenerRequest::*;
 
 fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 	use irc::*;
 	for chan in chan_list.iter() {
 		let msg = format!("Hello, {channel}!", channel=chan);
-		ctx.conn.write_msg(Talk(TargetList::from_str(chan), "How about a little $poll?"));
+		ctx.conn.write_msg(Talk(TargetList::from_str(chan), &msg[..]));
 	}
-	match exchange(&mut ctx.stream_events_tx, None) {None => {},Some(stream_events_tx) => {thread::spawn(move || {
-		let mut twitch: HashMap<String, bool> = stream_map("twitch");
-		stream_events_tx.send(format!("listening to twitch.tv streams: {:?}", twitch)).unwrap();
-		let mut hitbox: HashMap<String, bool> = stream_map("hitbox");
-		stream_events_tx.send(format!("listening to hitbox.tv streams: {:?}", hitbox)).unwrap();
+	let pulses = ctx.stream_requests.clone();
+	match exchange(&mut ctx.stream_resources, None) {None => {},Some((stream_events_tx, stream_requests_rx)) => {thread::spawn(move || {
+		let mut streams: HashMap<_,_> = stream_map("twitch").into_iter().map(|name| (Twitch(name), Err("not checked yet".to_string())))
+		.chain(stream_map("hitbox").into_iter().map(|name|(Hitbox(name), Err("not checked yet".to_string())))).collect();
+		let pulse_thread = std::thread::scoped(move ||{
+			pulses.send(UpdateStreams).unwrap();
+			loop {
+				std::thread::park_timeout(std::time::Duration::seconds(10));
+				pulses.send(UpdateStreams).unwrap();
+			}
+		});
 		let mut client = hyper::Client::new();
-		loop {
-			for (stream, online) in twitch.iter_mut() {
-				match (online, get_twitch_status(&mut client, stream)) {
-					(_, Ok(true)) => stream_events_tx.send(format!("{} is online", stream)).unwrap(),
-					(_, Ok(false)) => stream_events_tx.send(format!("{} is offline", stream)).unwrap(),
-					(_, Err(e)) => stream_events_tx.send(format!("cannot check online status of Twitch stream {}: {}", stream, e)).unwrap()
+		loop {match stream_requests_rx.recv().unwrap() {UpdateStreams => {
+			println!("pulse");
+			for (stream, status) in streams.iter_mut() {
+				let new_status = stream.get_status(&mut client);
+				if new_status != *status {
+					match new_status {
+						Ok(online) => stream_events_tx.send((None, if online {
+							format!("{:?} has gone on air!", stream)
+						} else {
+							format!("{:?} has gone offline", stream)
+						})).unwrap(),
+						Err(ref msg) => stream_events_tx.send((None, format!("Could not check status of Stream {:?}: {}", stream, msg.clone()))).unwrap()
+					}
+					*status = new_status;
 				}
 			}
-			for (stream, online) in hitbox.iter_mut() {
-				match (online, get_hitbox_status(&mut client, stream)) {
-					(_, Ok(true)) => stream_events_tx.send(format!("{} is online", stream)).unwrap(),
-					(_, Ok(false)) => stream_events_tx.send(format!("{} is offline", stream)).unwrap(),
-					(_, Err(e)) => stream_events_tx.send(format!("cannot check online status of Hitbox stream {}: {}", stream, e)).unwrap()
-				}
+		},
+		ListOnlineStreams(target) => {
+			for (stream, status) in streams.iter().filter(|(_, status)| status == Ok(true)) {
+				stream_events_tx.send((None, format!("Stream {:?} is online!", stream, msg.clone()))).unwrap()
 			}
-			std::thread::park_timeout(std::time::Duration::seconds(10))
 		}
+		_=>unimplemented!()}}
 	});}};
 }
 
@@ -270,8 +308,11 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 			true
 		},
 		Joined(client, list) => {
-			if irc::nick_from_mask(client) == ctx.cfg.nick {
+			let nick = irc::nick_from_mask(client);
+			if nick == ctx.cfg.nick {
 				on_joined(list, ctx);
+			} else {
+				ctx.stream_requests.send(ListOnlineStreams(nick.to_string())).unwrap()
 			}
 			true
 		},
@@ -303,13 +344,15 @@ fn bot(cfg: BotConfig) {
 	write.write_msg(irc::SetNick(cfg.nick));
 	write.write_msg(irc::Register(cfg.user, cfg.real_name));
 	let (stream_events_tx, stream_events) = channel();
+	let (stream_requests, stream_requests_rx) = channel();
 	let mut ctx = BotContext {
 		conn: write,
 		nick: Arc::new(cfg.nick.to_string()),
 		logged_in: false,
 		cfg: cfg,
 		poll: None,
-		stream_events_tx: Some(stream_events_tx)
+		stream_requests: stream_requests,
+		stream_resources: Some((stream_events_tx, stream_requests_rx))
 	};
 	loop {
 		select! {
@@ -325,7 +368,10 @@ fn bot(cfg: BotConfig) {
 				println!("Recv error: {}", e);
 				break;
 			}},
-			m = stream_events.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()))
+			m = stream_events.recv() => match m.unwrap() {
+				(None, msg) => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &msg[..])),
+				(Some(target), msg) => ctx.conn.write_msg(irc::Notify(irc::TargetList::from_str(&target[..]), &msg[..]))
+			}
 		}
 	}
 	irc_recv.join();
