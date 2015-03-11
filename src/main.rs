@@ -165,6 +165,13 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 				}
 			}}
 		},
+		"streams" => ctx.stream_requests.send(ListAllStreams(Some(msg_ctx.get_sender_nick().to_string()))).unwrap(),
+		"addstream" | "rmstream" | "removestream" => match (verb, args.find(' ')
+				.and_then(|p| Stream::new(&args[..p], args[p..].trim_left().to_string()))) {
+			("addstream", Some(stream)) => ctx.stream_requests.send(AddStream(stream)).unwrap(),
+			("rmstream", Some(stream))|("removestream", Some(stream)) => ctx.stream_requests.send(RemoveStream(stream)).unwrap(),
+			_ => msg_ctx.reply(&mut ctx.conn, &format!("usage (provider is one of 'twitch', 'hitbox'): {} <provider> <name>", verb))
+		},
 		"say" => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, args)),
 		"roll" => {
 			let (num_dice, num_sides) = args.find('d').map_or_else(|| (args, "6"), |p| (&args[..p], &args[(p+1)..]));
@@ -248,6 +255,32 @@ impl Stream {
 					))))
 		}
 	}
+	fn link(&self) -> String {
+		match self {
+			&Hitbox(ref name) => format!("http://hitbox.tv/{}", name),
+			&Twitch(ref name) => format!("http://twitch.tv/{}", name)
+		}
+	}
+	fn path(&self) -> std::path::PathBuf {
+		std::path::Path::new(match self {
+			&Hitbox(_) => "hitbox",
+			&Twitch(_) => "twitch"
+		}).join(match self{&Twitch(ref x)|&Hitbox(ref x)=>x})
+	}
+	fn create_entry(&self) -> std::io::Result<()> {
+		std::fs::File::create(&self.path()).map(|_| ())
+	}
+	fn remove_entry(&self) -> std::io::Result<()> {
+		std::fs::remove_file(&self.path())
+	}
+	fn new(provider: &str, name: String) -> Option<Stream> {
+		if name.contains('/') { return None }	// FIXME: maybe find a crossplatforn way to prevent filesystem access?
+		match provider {
+			"hitbox" | "hitbox.tv" => Some(Hitbox(name)),
+			"twitch" | "twitch.tv" => Some(Twitch(name)),
+			_ => None
+		}
+	}
 }
 
 fn stream_map(dir: &str) -> Vec<String> {
@@ -256,7 +289,7 @@ fn stream_map(dir: &str) -> Vec<String> {
 			Ok(de) => de.path().file_name().and_then(|s| s.to_str()).map(|s| s.to_string()),
 			Err(_) => None
 		}).collect(),
-		Err(_) => Vec::new()
+		Err(_) => {std::fs::create_dir(dir).unwrap(); Vec::new()}
 	}
 }
 
@@ -294,7 +327,7 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 				if new_status != *status {
 					match new_status {
 						Ok(online) => stream_events_tx.send((None, if online != None {
-							format!("{:?} has gone on air!", stream)
+							format!("=== {:?} has gone on air! {}", stream, stream.link())
 						} else {
 							format!("{:?} has gone offline", stream)
 						})).unwrap(),
@@ -316,7 +349,20 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 				Err(ref e) => format!("status of Stream {:?} could not be checked: {}", stream, e),
 			})).unwrap()}
 		},
-		_=>unimplemented!()}}
+		AddStream(stream) => if !streams.contains_key(&stream) {
+			match stream.create_entry() {
+				Ok(_) => stream_events_tx.send((None, format!("{:?} added to the stream list", stream))).unwrap(),
+				Err(e) =>  stream_events_tx.send((None, format!("could not add {:?} to the stream list: {}", stream, e))).unwrap()
+			}
+			streams.insert(stream, Err("not checked yet".to_string()));
+		} else {stream_events_tx.send((None, format!("{:?} is already on the stream list", stream))).unwrap()},
+		RemoveStream(stream) => if streams.contains_key(&stream) {
+			match stream.remove_entry() {
+				Ok(_) => stream_events_tx.send((None, format!("{:?} removed from the stream list", stream))).unwrap(),
+				Err(e) =>  stream_events_tx.send((None, format!("could not remove {:?} from the stream list: {}", stream, e))).unwrap()
+			}
+			streams.remove(&stream);
+		} else {stream_events_tx.send((None, format!("{:?} is not on the stream list", stream))).unwrap()}}}
 	});}};
 }
 
