@@ -295,6 +295,13 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 				Ok(Some(start)) => stream_events_tx.send((Some(target.clone()), format!("Stream {:?} is streaming since {}!", stream, start))).unwrap(),
 			_=>{}}}
 		}
+		ListAllStreams(target) => {
+			for (stream, status) in streams.iter() {stream_events_tx.send((target.clone(), match *status {
+				Ok(Some(ref start)) => format!("Stream {:?} is streaming since {}!", stream, start),
+				Ok(None) => format!("Stream {:?} is offline", stream),
+				Err(ref e) => format!("status of Stream {:?} could not be checked: {}", stream, e),
+			})).unwrap()}
+		},
 		_=>unimplemented!()}}
 	});}};
 }
