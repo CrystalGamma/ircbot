@@ -10,6 +10,7 @@ extern crate hyper;
 extern crate "rustc-serialize" as serialize;
 use serialize::json::Json;
 extern crate chrono;
+use chrono::offset::TimeZone;
 
 use std::io::prelude::*;
 use std::net;
@@ -213,12 +214,12 @@ impl Stream {
 						})
 				}),
 			&Hitbox(ref name) => http.get(&format!("http://api.hitbox.tv/media/live/{}", name)[..]).send()
-				.map_err(|e|format!("{}", e))
+				.map_err(|e|format!("HTTP send error: {}", e))
 				.and_then(|mut response|{
 					if response.status != hyper::Ok {return Err(format!("{}", response.status))}
 					let mut buf = String::new();
-					response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
-				}).and_then(|s|Json::from_str(&s[..]).map_err(|e|format!("{}",e)))
+					response.read_to_string(&mut buf).map_err(|e|format!("HTTP error: {}", e)).map(|_|buf)
+				}).and_then(|s|Json::from_str(&s[..]).map_err(|e|format!("JSON parser: {}",e)))
 				.and_then(
 					|json: Json|json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string())
 					.and_then(|obj| obj.get("livestream").ok_or_else(||"'livestream' property missing in JSON document".to_string()))
@@ -226,9 +227,22 @@ impl Stream {
 					.and_then(|arr| arr.iter().fold(Ok(None),
 						|res, json: &Json| res.and_then(|online|match online {
 							None => json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
-							.and_then(|obj| obj.get("media_is_live").ok_or_else(|| "one of the 'livestream' entries does not have a 'media_is_live' property".to_string()))
-							.and_then(|json: &Json|json.as_string().ok_or_else(|| "'media_is_live' is not a string in one of the 'livestream' entries".to_string())
-							.map(|s| None/*&s[..] != "0"*/)),
+							.and_then(|obj|match obj.get("media_is_live") {
+								Some(json) => if match json.as_string() {
+									None => return Err("'media_is_live' is not a string".to_string()),
+									Some(x) => x
+								} == "0" { Ok(None) } else {
+									match obj.get("media_live_since").and_then(|json|json.as_string()) {
+										None => Err("'media_live_since' is not a string".to_string()),
+										Some(start) => chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%d %H:%M:%S")
+											.map(|naive|chrono::Local.from_utc_datetime(&naive))
+											.map(|x|Some(x))
+											.map_err(|e| format!("Time parsing error: {}", e))
+									}
+
+								},
+								None => Err("'media_is_live' is missing from one of the stream objects".to_string())
+							}),
 							Some(x) => Ok(Some(x))
 						}
 					))))
