@@ -197,8 +197,33 @@ enum Stream {
 }
 use Stream::*;
 
+#[derive(PartialEq)]
+struct StreamStatus(Option<(String, Option<String>, chrono::DateTime<chrono::Local>)>);
+
+impl StreamStatus {
+	fn is_online(&self) -> bool {match self {
+		&StreamStatus(None) => false,
+		_ => true
+	}}
+
+	fn link(&self) -> Option<&str> {match self.0 {
+		Some((ref s, _, _)) => Some(&s[..]),
+		_ => None
+	}}
+	fn game(&self) -> Option<&str> {match self.0 {
+		Some((_, Some(ref s), _)) => Some(&s[..]),
+		_ => None
+	}}
+	fn start_time(&self) -> Option<chrono::DateTime<chrono::Local>> { match self.0{
+		Some((_, _, ref time)) => Some(time.clone()),
+		_ => None
+	}}
+}
+
+
+
 impl Stream {
-	fn get_status<C: hyper::net::NetworkConnector>(&self, http: &mut hyper::Client<C>) -> Result<Option<chrono::DateTime<chrono::Local>>, String> {
+	fn get_status<C: hyper::net::NetworkConnector>(&self, http: &mut hyper::Client<C>) -> Result<StreamStatus, String> {
 		match self {
 			&Twitch(ref name) => http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..])
 				.header(hyper::header::Accept(
@@ -216,8 +241,9 @@ impl Stream {
 						.and_then(|json| match json.as_object() {
 							Some(obj) => obj.get("created_at").ok_or_else(||"'created_at' property missing from stream status".to_string())
 								.and_then(|json| json.as_string().ok_or_else(||"'created_at' property of stream status is not a string".to_string()))
-								.and_then(|s| s.parse().map_err(|_|"could not parse stream start time".to_string()).map(|x|Some(x))),
-							None => Ok(None)
+								.and_then(|s| s.parse().map_err(|_|"could not parse stream start time".to_string())
+								.map(|x|StreamStatus(Some((format!("http://twitch.tv/{}", name), None, x))))),
+							None => Ok(StreamStatus(None))
 						})
 				}),
 			&Hitbox(ref name) => http.get(&format!("http://api.hitbox.tv/media/live/{}", name)[..]).send()
@@ -231,27 +257,26 @@ impl Stream {
 					|json: Json|json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string())
 					.and_then(|obj| obj.get("livestream").ok_or_else(||"'livestream' property missing in JSON document".to_string()))
 					.and_then(|json|json.as_array().ok_or_else(||"'livestream' property is not an array".to_string()))
-					.and_then(|arr| arr.iter().fold(Ok(None),
-						|res, json: &Json| res.and_then(|online|match online {
-							None => json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
+					.and_then(|arr| arr.iter().fold(Ok(StreamStatus(None)),
+						|res, json: &Json| res.and_then(|online| if online.is_online() {
+							json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
 							.and_then(|obj|match obj.get("media_is_live") {
 								Some(json) => if match json.as_string() {
 									None => return Err("'media_is_live' is not a string".to_string()),
 									Some(x) => x
-								} == "0" { Ok(None) } else {
+								} == "0" { Ok(StreamStatus(None)) } else {
 									match obj.get("media_live_since").and_then(|json|json.as_string()) {
 										None => Err("'media_live_since' is not a string".to_string()),
 										Some(start) => chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%d %H:%M:%S")
 											.map(|naive|chrono::Local.from_utc_datetime(&naive))
-											.map(|x|Some(x))
+											.map(|x|StreamStatus(Some((format!("http://hitbox.tv/{}", name), None, x))))
 											.map_err(|e| format!("Time parsing error: {}", e))
 									}
 
 								},
 								None => Err("'media_is_live' is missing from one of the stream objects".to_string())
-							}),
-							Some(x) => Ok(Some(x))
-						}
+							})
+						} else {Ok(online)}
 					))))
 		}
 	}
@@ -326,9 +351,10 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 				let new_status = stream.get_status(&mut client);
 				if new_status != *status {
 					match new_status {
-						Ok(online) => stream_events_tx.send((None, if online != None {
-							format!("=== {:?} has gone on air! {}", stream, stream.link())
-						} else {
+						Ok(ref online) => stream_events_tx.send((None, if online.is_online() {match online.game() {
+							None => format!("=== {:?} has gone on air! === {}", stream, stream.link()),
+							Some(game) => format!("=== {:?} has gone on air! === Game: {} === {}", stream, game, online.link().unwrap()),
+						}} else {
 							format!("{:?} has gone offline", stream)
 						})).unwrap(),
 						Err(ref msg) => stream_events_tx.send((None, format!("Could not check status of Stream {:?}: {}", stream, msg.clone()))).unwrap()
@@ -339,13 +365,17 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 		},
 		ListOnlineStreams(target) => {
 			for (stream, status) in streams.iter() {match *status {
-				Ok(Some(start)) => stream_events_tx.send((Some(target.clone()), format!("Stream {:?} is streaming since {}!", stream, start))).unwrap(),
+				Ok(ref status) if status.is_online() => stream_events_tx.send((Some(target.clone()),
+					format!("Stream {:?} is streaming since {}!", stream, status.start_time().unwrap()))).unwrap(),
 			_=>{}}}
 		}
 		ListAllStreams(target) => {
 			for (stream, status) in streams.iter() {stream_events_tx.send((target.clone(), match *status {
-				Ok(Some(ref start)) => format!("Stream {:?} is streaming since {}!", stream, start),
-				Ok(None) => format!("Stream {:?} is offline", stream),
+				Ok(ref status)  => if status.is_online() {
+					format!("Stream {:?} is streaming since {}!", stream, status.start_time().unwrap())
+				} else {
+					format!("Stream {:?} is offline", stream)
+				},
 				Err(ref e) => format!("status of Stream {:?} could not be checked: {}", stream, e),
 			})).unwrap()}
 		},
