@@ -1,16 +1,15 @@
-#![feature(io)]
-#![feature(net)]
 #![feature(std_misc)]
 #![feature(core)]
-#![feature(path)]
 extern crate irc;
 extern crate rand;
 use rand::Rng;
 extern crate hyper;
-extern crate "rustc-serialize" as serialize;
+extern crate rustc_serialize as serialize;
 use serialize::json::Json;
 extern crate chrono;
 use chrono::offset::TimeZone;
+extern crate regex;
+use regex::Regex;
 
 use std::io::prelude::*;
 use std::net;
@@ -43,7 +42,8 @@ struct BotContext<'a> {
 	cfg: BotConfig,
 	poll: Option<(String, Vec<(String, u32)>)>,
 	stream_requests: Sender<StreamListenerRequest>,
-	stream_resources: Option<(Sender<(Option<String>, String)>, Receiver<StreamListenerRequest>)>
+	stream_resources: Option<(Sender<(Option<String>, String)>, Receiver<StreamListenerRequest>)>,
+	title_tx: Sender<String>
 }
 
 impl<'a> IrcWriter<'a> {
@@ -178,7 +178,7 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 			match (num_dice.parse::<u16>(), num_sides.parse::<u16>()) {
 				(Ok(dice), Ok(sides)) => {
 					let mut rng = rand::thread_rng();
-					let res = range(0, dice).map(|_| rng.gen_range(0, sides) as u32+1).fold(0, |a, b| a+b);
+					let res = (0..dice).map(|_| rng.gen_range(0, sides) as u32+1).fold(0, |a, b| a+b);
 					let reply = format!("{}d{}: {}", dice, sides, res);
 					msg_ctx.reply(&mut ctx.conn, &reply[..])
 				}
@@ -404,7 +404,34 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 			let cmd = &text[ctx.cfg.cmd_prefix.len()..];
 			let msg_ctx = MessageContext::new(sender, targets, ctx);
 			handle_cmd(cmd, msg_ctx, ctx)
-		} else {true},
+		} else {
+			for word in text.split(|c:char| c.is_whitespace()) {
+				if word.len() < 4 || word.ends_with('.') || !word.contains(|c| c=='.') {continue}
+				let tx = ctx.title_tx.clone();
+				let url = if word.starts_with("http://") || word.starts_with("https://") {
+					word.to_string()
+				} else {
+					format!("http://{}",word)
+				};
+				thread::spawn(move ||{
+					let mut http = hyper::Client::new();
+					match http.get(&url[..]).send()
+						.map_err(|e|format!("HTTP send error: {}", e))
+						.and_then(|mut response|{
+							if response.status != hyper::Ok {return Err(format!("{}", response.status))}
+							let mut buf = String::new();
+							response.read_to_string(&mut buf).map_err(|e|format!("HTTP error: {}", e)).map(|_|buf)
+						}).and_then(|text| Regex::new("(?i)<\\s*title\\s*>([^<]*)<\\s*/title\\s*>").unwrap()	// yes, shame on me for using a regex for this
+							.captures(&text).ok_or_else(||"no title tag".to_string())
+							.and_then(|cap| cap.at(1).ok_or_else(|| "no match".to_string()))
+							.map(|title| title.to_string())) {
+						Ok(title) => tx.send(title).unwrap(),
+						Err(msg) => {}
+					}
+				});
+			}
+			true
+		},
 		Welcome(_) => {
 			ctx.logged_in = true;
 			ctx.conn.write_msg(Join(ctx.cfg.chan, None));
@@ -448,6 +475,7 @@ fn bot(cfg: BotConfig) {
 	write.write_msg(irc::Register(cfg.user, cfg.real_name));
 	let (stream_events_tx, stream_events) = channel();
 	let (stream_requests, stream_requests_rx) = channel();
+	let (title_tx, title_rx) = channel();
 	let mut ctx = BotContext {
 		conn: write,
 		nick: Arc::new(cfg.nick.to_string()),
@@ -455,7 +483,8 @@ fn bot(cfg: BotConfig) {
 		cfg: cfg,
 		poll: None,
 		stream_requests: stream_requests,
-		stream_resources: Some((stream_events_tx, stream_requests_rx))
+		stream_resources: Some((stream_events_tx, stream_requests_rx)),
+		title_tx: title_tx
 	};
 	loop {
 		select! {
@@ -474,7 +503,8 @@ fn bot(cfg: BotConfig) {
 			m = stream_events.recv() => match m.unwrap() {
 				(None, msg) => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &msg[..])),
 				(Some(target), msg) => ctx.conn.write_msg(irc::Notify(irc::TargetList::from_str(&target[..]), &msg[..]))
-			}
+			},
+			m = title_rx.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()[..]))
 		}
 	}
 	irc_recv.join();
