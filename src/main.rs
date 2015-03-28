@@ -43,7 +43,8 @@ struct BotContext<'a> {
 	poll: Option<(String, Vec<(String, u32)>)>,
 	stream_requests: Sender<StreamListenerRequest>,
 	stream_resources: Option<(Sender<(Option<String>, String)>, Receiver<StreamListenerRequest>)>,
-	title_tx: Sender<String>
+	title_tx: Sender<String>,
+	joins_tx: Sender<String>
 }
 
 impl<'a> IrcWriter<'a> {
@@ -413,6 +414,7 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 				} else {
 					format!("http://{}",word)
 				};
+				// TODO: Imgur handling
 				thread::spawn(move ||{
 					let mut http = hyper::Client::new();
 					match http.get(&url[..]).send()
@@ -442,7 +444,8 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 			if nick == ctx.cfg.nick {
 				on_joined(list, ctx);
 			} else {
-				ctx.stream_requests.send(ListOnlineStreams(nick.to_string())).unwrap()
+				ctx.stream_requests.send(ListOnlineStreams(nick.to_string())).unwrap();
+				ctx.joins_tx.send(nick.to_string()).unwrap();
 			}
 			true
 		},
@@ -452,6 +455,65 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 		_ => true
 	}
 }
+
+#[derive(Clone)]
+struct JoinUser {
+	num_visits: u32,
+	last_visit: chrono::DateTime<chrono::Local>,
+	first_visit: chrono::DateTime<chrono::Local>
+}
+
+enum JoinStatus{
+	User(JoinUser),
+	Alias(String)
+}
+
+struct JoinDB(HashMap<String, JoinStatus>);
+
+impl JoinDB {
+	pub fn new() -> JoinDB {JoinDB(HashMap::new())}
+	fn fetch(&self, name: &str) -> Option<&JoinUser> {
+		match self.0.get(name) {
+			Some(&JoinStatus::Alias(ref name2)) => match self.0.get(name) {
+				Some(&JoinStatus::User(ref u)) => Some(u),
+				_ => None
+			},
+			Some(&JoinStatus::User(ref u)) => Some(u),
+			None => None
+		}
+	}
+	fn update(&mut self, name: String, new: JoinStatus) -> String {
+		let name2 = match self.0.get(&name) {
+			Some(&JoinStatus::Alias(ref name2)) => Some(name2.to_string()),	// this is really awkward, but we must not freeze the HashMap :(
+			_ => None
+		};
+		if let Some(name2_) = name2 {
+			self.0.insert(name2_.clone(), new);
+			name2_
+		} else {
+			self.0.insert(name.clone(), new);
+			name
+		}
+	}
+	pub fn join(&mut self, name: String) -> (String, Option<JoinUser>) {
+		let now = chrono::Local::now();
+		let (is_new, user) = self.fetch(&name).map(|s|(false, s.clone())).unwrap_or_else(
+			|| (true, JoinUser {num_visits: 0, first_visit: now, last_visit: now}));
+		let name = self.update(name, JoinStatus::User(JoinUser {
+			num_visits: user.num_visits+1, first_visit: user.first_visit, last_visit: now}));
+		(name, if is_new {None} else {Some(user)})
+	}
+}
+
+fn ordinal(i: u32) -> &'static str {
+	match i % 10 {
+		1 if i != 11 => "st",
+		2 if i != 12 => "nd",
+		3 if i != 13 => "rd",
+		_ => "th"
+	}
+}
+
 
 fn bot(cfg: BotConfig) {
     let mut conn = net::TcpStream::connect(&cfg.server).unwrap();
@@ -476,6 +538,8 @@ fn bot(cfg: BotConfig) {
 	let (stream_events_tx, stream_events) = channel();
 	let (stream_requests, stream_requests_rx) = channel();
 	let (title_tx, title_rx) = channel();
+	let (joins_tx, joins_rx) = channel();
+	let (joinlog_tx, joinlog_rx) = channel();
 	let mut ctx = BotContext {
 		conn: write,
 		nick: Arc::new(cfg.nick.to_string()),
@@ -484,8 +548,22 @@ fn bot(cfg: BotConfig) {
 		poll: None,
 		stream_requests: stream_requests,
 		stream_resources: Some((stream_events_tx, stream_requests_rx)),
-		title_tx: title_tx
+		title_tx: title_tx,
+		joins_tx: joins_tx
 	};
+	thread::spawn(move ||{
+		let mut joins = JoinDB::new();
+		while let Ok(nick) = joins_rx.recv() {
+			match joins.join(nick) {
+				(nick, Some(user)) => {
+					let count = user.num_visits + 1;
+					joinlog_tx.send(format!("Welcome back my child {}. This is your {}{} visit that I have witnessed.",
+						nick, count, ordinal(count))).unwrap()
+				},
+				(nick, None) => joinlog_tx.send(format!("Hello {}. I don't think I have seen you around. Make yourself at home.", nick)).unwrap()
+			}
+		}
+	});
 	loop {
 		select! {
 			m = rx.recv() => match m.unwrap() { Ok(s) => {
@@ -504,7 +582,8 @@ fn bot(cfg: BotConfig) {
 				(None, msg) => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &msg[..])),
 				(Some(target), msg) => ctx.conn.write_msg(irc::Notify(irc::TargetList::from_str(&target[..]), &msg[..]))
 			},
-			m = title_rx.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()[..]))
+			m = title_rx.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()[..])),
+			m = joinlog_rx.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()[..]))
 		}
 	}
 	irc_recv.join();
