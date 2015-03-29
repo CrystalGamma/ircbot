@@ -1,3 +1,19 @@
+/* an IRC bot
+    Copyright (C) 2015 Jona Stubbe
+
+    This program is free software; you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation; either version 2 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License along
+    with this program; if not, write to the Free Software Foundation, Inc.,
+    51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.*/
 #![feature(std_misc)]
 #![feature(core)]
 extern crate irc;
@@ -119,7 +135,7 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 				}
 			}}
 		},
-		"streams" => ctx.stream_requests.send(ListAllStreams(Some(msg_ctx.get_sender_nick().to_string()))).unwrap(),
+		"streams" | "lsstream" | "lsstream" => ctx.stream_requests.send(ListAllStreams(Some(msg_ctx.get_sender_nick().to_string()))).unwrap(),
 		"addstream" | "rmstream" | "removestream" => match (verb, args.find(' ')
 				.and_then(|p| Stream::new(&args[..p], args[p..].trim_left().to_string()))) {
 			("addstream", Some(stream)) => ctx.stream_requests.send(AddStream(stream)).unwrap(),
