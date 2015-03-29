@@ -26,6 +26,8 @@ macro_rules! tryopt{
 
 mod joindb;
 use joindb::*;
+mod stream;
+use stream::*;
 
 fn exchange<T>(a: &mut T, mut b: T) -> T {
 	std::mem::swap(a, &mut b);
@@ -199,121 +201,7 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 	true
 }
 
-#[derive(PartialEq,Eq,Hash,Clone,Debug)]
-enum Stream {
-	Hitbox(String),
-	Twitch(String)
-}
-use Stream::*;
 
-#[derive(PartialEq)]
-struct StreamStatus(Option<(String, Option<String>, chrono::DateTime<chrono::Local>)>);
-
-impl StreamStatus {
-	fn is_online(&self) -> bool {match self {
-		&StreamStatus(None) => false,
-		_ => true
-	}}
-
-	fn link(&self) -> Option<&str> {match self.0 {
-		Some((ref s, _, _)) => Some(&s[..]),
-		_ => None
-	}}
-	fn game(&self) -> Option<&str> {match self.0 {
-		Some((_, Some(ref s), _)) => Some(&s[..]),
-		_ => None
-	}}
-	fn start_time(&self) -> Option<chrono::DateTime<chrono::Local>> { match self.0{
-		Some((_, _, ref time)) => Some(time.clone()),
-		_ => None
-	}}
-}
-
-impl Stream {
-	fn get_status<C: hyper::net::NetworkConnector>(&self, http: &mut hyper::Client<C>) -> Result<StreamStatus, String> {
-		match self {
-			&Twitch(ref name) => http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..])
-				.header(hyper::header::Accept(
-					vec![hyper::header::qitem("application/vnd.twitchtv.v3+json".parse().ok().expect("couldnt parse MIME type"))]
-				)).send().map_err(|_|"could not query api.twitch.tv".to_string())
-				.and_then(|mut response| {
-					if response.status != hyper::Ok {return Err(format!("{}", response.status))}
-					let mut buf = String::new();
-					response.read_to_string(&mut buf).map_err(|e|format!("{}", e)).map(|_|buf)
-				}).and_then(|s| Json::from_str(&s[..]).map_err(|e| format!("{}", e)))
-				.and_then(|json|{
-					json.as_object().ok_or_else(||"Twitch API didn't return a JSON object".to_string())
-					.and_then(|obj| obj.get("stream").ok_or_else(
-						||"'stream' property missing in JSON document".to_string()))
-						.and_then(|json| match json.as_object() {
-							Some(obj) => obj.get("created_at").ok_or_else(||"'created_at' property missing from stream status".to_string())
-								.and_then(|json| json.as_string().ok_or_else(||"'created_at' property of stream status is not a string".to_string()))
-								.and_then(|s| s.parse().map_err(|_|"could not parse stream start time".to_string())
-								.map(|x|StreamStatus(Some((format!("http://twitch.tv/{}", name), None, x))))),
-							None => Ok(StreamStatus(None))
-						})
-				}),
-			&Hitbox(ref name) => http.get(&format!("http://api.hitbox.tv/media/live/{}", name)[..]).send()
-				.map_err(|e|format!("HTTP send error: {}", e))
-				.and_then(|mut response|{
-					if response.status != hyper::Ok {return Err(format!("{}", response.status))}
-					let mut buf = String::new();
-					response.read_to_string(&mut buf).map_err(|e|format!("HTTP error: {}", e)).map(|_|buf)
-				}).and_then(|s|Json::from_str(&s[..]).map_err(|e|format!("JSON parser: {}",e)))
-				.and_then(
-					|json: Json|json.as_object().ok_or("Hitbox API didn't return a JSON object".to_string())
-					.and_then(|obj| obj.get("livestream").ok_or_else(||"'livestream' property missing in JSON document".to_string()))
-					.and_then(|json|json.as_array().ok_or_else(||"'livestream' property is not an array".to_string()))
-					.and_then(|arr| arr.iter().fold(Ok(StreamStatus(None)),
-						|res, json: &Json| res.and_then(|online| if online.is_online() {
-							json.as_object().ok_or_else(||"one of the 'livestream' entries is not a JSON object".to_string())
-							.and_then(|obj|match obj.get("media_is_live") {
-								Some(json) => if match json.as_string() {
-									None => return Err("'media_is_live' is not a string".to_string()),
-									Some(x) => x
-								} == "0" { Ok(StreamStatus(None)) } else {
-									match obj.get("media_live_since").and_then(|json|json.as_string()) {
-										None => Err("'media_live_since' is not a string".to_string()),
-										Some(start) => chrono::NaiveDateTime::parse_from_str(start, "%Y-%m-%d %H:%M:%S")
-											.map(|naive|chrono::Local.from_utc_datetime(&naive))
-											.map(|x|StreamStatus(Some((format!("http://hitbox.tv/{}", name), None, x))))
-											.map_err(|e| format!("Time parsing error: {}", e))
-									}
-
-								},
-								None => Err("'media_is_live' is missing from one of the stream objects".to_string())
-							})
-						} else {Ok(online)}
-					))))
-		}
-	}
-	fn link(&self) -> String {
-		match self {
-			&Hitbox(ref name) => format!("http://hitbox.tv/{}", name),
-			&Twitch(ref name) => format!("http://twitch.tv/{}", name)
-		}
-	}
-	fn path(&self) -> std::path::PathBuf {
-		std::path::Path::new(match self {
-			&Hitbox(_) => "hitbox",
-			&Twitch(_) => "twitch"
-		}).join(match self{&Twitch(ref x)|&Hitbox(ref x)=>x})
-	}
-	fn create_entry(&self) -> std::io::Result<()> {
-		std::fs::File::create(&self.path()).map(|_| ())
-	}
-	fn remove_entry(&self) -> std::io::Result<()> {
-		std::fs::remove_file(&self.path())
-	}
-	fn new(provider: &str, name: String) -> Option<Stream> {
-		if name.contains('/') { return None }	// FIXME: maybe find a crossplatforn way to prevent filesystem access?
-		match provider {
-			"hitbox" | "hitbox.tv" => Some(Hitbox(name)),
-			"twitch" | "twitch.tv" => Some(Twitch(name)),
-			_ => None
-		}
-	}
-}
 
 fn stream_map(dir: &str) -> Vec<String> {
 	match std::fs::read_dir(dir) {
@@ -359,7 +247,7 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 				if new_status != *status {
 					match new_status {
 						Ok(ref online) => stream_events_tx.send((None, if online.is_online() {match online.game() {
-							None => format!("=== {:?} has gone on air! === {}", stream, stream.link()),
+							None => format!("=== {:?} has gone on air! === {}", stream, online.link().unwrap()),
 							Some(game) => format!("=== {:?} has gone on air! === Game: {} === {}", stream, game, online.link().unwrap()),
 						}} else {
 							format!("{:?} has gone offline", stream)
