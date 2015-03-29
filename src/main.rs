@@ -5,9 +5,7 @@ extern crate rand;
 use rand::Rng;
 extern crate hyper;
 extern crate rustc_serialize as serialize;
-use serialize::json::{Json, ToJson};
 extern crate chrono;
-use chrono::offset::TimeZone;
 extern crate regex;
 use regex::Regex;
 
@@ -18,7 +16,6 @@ use std::sync::mpsc::{channel, Sender, Receiver};
 use std::str::Pattern;
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::path::Path;
 
 macro_rules! tryopt{
 	($e:expr) => (match $e {Some(x) => x, _ => return None})
@@ -28,6 +25,8 @@ mod joindb;
 use joindb::*;
 mod stream;
 use stream::*;
+mod ircwriter;
+use ircwriter::*;
 
 fn exchange<T>(a: &mut T, mut b: T) -> T {
 	std::mem::swap(a, &mut b);
@@ -43,8 +42,6 @@ struct BotConfig {
 	cmd_prefix: &'static str
 }
 
-struct IrcWriter<'a>{conn: &'a mut net::TcpStream}
-
 struct BotContext<'a> {
 	conn: IrcWriter<'a>,
 	nick: Arc<String>,
@@ -55,60 +52,6 @@ struct BotContext<'a> {
 	stream_resources: Option<(Sender<(Option<String>, String)>, Receiver<StreamListenerRequest>)>,
 	title_tx: Sender<String>,
 	joins_tx: Sender<String>
-}
-
-impl<'a> IrcWriter<'a> {
-	unsafe fn write_raw(&mut self, msg: String) {
-		println!("< {}", msg);
-		write!(self.conn, "{}\r\n",msg).unwrap();
-	}
-	fn write_msg(&mut self, msg: irc::TypedMessage) {
-		let raw = msg.to_dumb();
-		println!("< {}", raw);
-		write!(self.conn, "{}\r\n", raw).unwrap();
-	}
-}
-
-struct MessageContext<'a>{
-	targets: irc::TargetList<'a>,
-	sender: &'a str,
-	nick: Arc<String>
-}
-
-impl<'a> MessageContext<'a> {
-	fn reply(&self, conn: &mut IrcWriter, text: &str) {	// TODO: maybe not allocate if we have only 1 target (common case)
-		let mut channels = Vec::new();
-		let mut clients = Vec::new();
-		for t in self.targets.iter() {
-			if irc::is_channel_name(t) {
-				channels.push(t);
-			} else { if t != *self.nick {
-				clients.push(t);
-			} else {
-				clients.push(self.sender)
-			}}
-		}
-		if clients.len() > 0 {
-			let target = clients.connect(",");
-			conn.write_msg(irc::Notify(irc::TargetList::from_str(&target[..]), text));
-		}
-		if channels.len() > 0 {
-			let target = channels.connect(",");
-			conn.write_msg(irc::Talk(irc::TargetList::from_str(&target[..]), text));
-		}
-	}
-
-	fn reply_private(&self, conn: &mut IrcWriter, text: &str) {
-		conn.write_msg(irc::Notify(irc::TargetList::from_str(self.sender), text));
-	}
-
-	fn get_sender_nick(&self) -> &'a str {
-		self.sender
-	}
-
-	fn new(sender: &'a str, targets: irc::TargetList<'a>, ctx: &BotContext) -> MessageContext<'a> {
-		MessageContext {targets: targets, sender: irc::nick_from_mask(sender), nick: ctx.nick.clone()}
-	}
 }
 
 fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool {
@@ -297,7 +240,7 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 	match semantic {
 		Msg(sender, targets, text) => if ctx.cfg.cmd_prefix.is_prefix_of(text) {
 			let cmd = &text[ctx.cfg.cmd_prefix.len()..];
-			let msg_ctx = MessageContext::new(sender, targets, ctx);
+			let msg_ctx = MessageContext::new(sender, targets, &ctx.nick);
 			handle_cmd(cmd, msg_ctx, ctx)
 		} else {
 			for word in text.split(|c:char| c.is_whitespace()) {
@@ -376,7 +319,7 @@ fn bot(cfg: BotConfig) {
 			};
 		}
 	});
-	let mut write = IrcWriter{conn: &mut conn};
+	let mut write = IrcWriter::new(&mut conn);
 	write.write_msg(irc::SetNick(cfg.nick));
 	write.write_msg(irc::Register(cfg.user, cfg.real_name));
 	let (stream_events_tx, stream_events) = channel();
