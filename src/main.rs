@@ -468,10 +468,10 @@ enum JoinStatus{
 	Alias(String)
 }
 
-struct JoinDB(HashMap<String, JoinStatus>);
+struct MemJoinDB(HashMap<String, JoinStatus>);
 
-impl JoinDB {
-	pub fn new() -> JoinDB {JoinDB(HashMap::new())}
+impl MemJoinDB {
+	pub fn new() -> MemJoinDB {MemJoinDB(HashMap::new())}
 	fn fetch(&self, name: &str) -> Option<&JoinUser> {
 		match self.0.get(name) {
 			Some(&JoinStatus::Alias(ref name2)) => match self.0.get(name) {
@@ -482,8 +482,8 @@ impl JoinDB {
 			None => None
 		}
 	}
-	fn update(&mut self, name: String, new: JoinStatus) -> String {
-		let name2 = match self.0.get(&name) {
+	fn update(&mut self, name: &str, new: JoinStatus) -> String {
+		let name2 = match self.0.get(name) {
 			Some(&JoinStatus::Alias(ref name2)) => Some(name2.to_string()),	// this is really awkward, but we must not freeze the HashMap :(
 			_ => None
 		};
@@ -491,13 +491,19 @@ impl JoinDB {
 			self.0.insert(name2_.clone(), new);
 			name2_
 		} else {
-			self.0.insert(name.clone(), new);
-			name
+			self.0.insert(name.to_string(), new);
+			name.to_string()
 		}
 	}
-	pub fn join(&mut self, name: String) -> (String, Option<JoinUser>) {
+}
+
+trait JoinDB {
+	fn join(&mut self, name: &str) -> (String, Option<JoinUser>);
+}
+impl JoinDB for MemJoinDB {
+	fn join(&mut self, name: &str) -> (String, Option<JoinUser>) {
 		let now = chrono::Local::now();
-		let (is_new, user) = self.fetch(&name).map(|s|(false, s.clone())).unwrap_or_else(
+		let (is_new, user) = self.fetch(name).map(|s|(false, s.clone())).unwrap_or_else(
 			|| (true, JoinUser {num_visits: 0, first_visit: now, last_visit: now}));
 		let name = self.update(name, JoinStatus::User(JoinUser {
 			num_visits: user.num_visits+1, first_visit: user.first_visit, last_visit: now}));
@@ -513,7 +519,6 @@ fn ordinal(i: u32) -> &'static str {
 		_ => "th"
 	}
 }
-
 
 fn bot(cfg: BotConfig) {
     let mut conn = net::TcpStream::connect(&cfg.server).unwrap();
@@ -552,9 +557,9 @@ fn bot(cfg: BotConfig) {
 		joins_tx: joins_tx
 	};
 	thread::spawn(move ||{
-		let mut joins = JoinDB::new();
+		let mut joins = MemJoinDB::new();
 		while let Ok(nick) = joins_rx.recv() {
-			match joins.join(nick) {
+			match joins.join(&nick) {
 				(nick, Some(user)) => {
 					let count = user.num_visits + 1;
 					joinlog_tx.send(format!("Welcome back my child {}. This is your {}{} visit that I have witnessed.",
@@ -592,7 +597,7 @@ fn bot(cfg: BotConfig) {
 
 fn main() {
 	bot(BotConfig {
-		server: net::ToSocketAddrs::to_socket_addrs(&("irc.quakenet.org", 6667)).unwrap().next().expect("could not look up server hostname"),
+		server: net::ToSocketAddrs::to_socket_addrs(&("irc.quakenet.org", 6667)).unwrap().next().expect("server hostname not found"),
 		nick: "RidikaLukria",
 		user: "ridika",
 		real_name: "(I'm a bot) Ridika Lūkria, Göttin des Feuers",
