@@ -1,6 +1,5 @@
 use hyper::{Client, header};
 use hyper::Ok as HttpOk;
-use hyper::net::NetworkConnector;
 use chrono::{Local, DateTime, NaiveDateTime};
 use chrono::offset::TimeZone;
 use serialize::json::Json;
@@ -56,7 +55,7 @@ impl StreamStatus {
 }
 
 impl Stream {
-	pub fn get_status<C: NetworkConnector>(&self, http: &mut Client<C>) -> Result<StreamStatus, String> {
+	pub fn get_status(&self, http: &mut Client) -> Result<StreamStatus, String> {
 		match self {
 			&Twitch(ref name) => http.get(&format!("https://api.twitch.tv/kraken/streams/{}", name)[..])
 				.header(header::Accept(

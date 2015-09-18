@@ -23,7 +23,7 @@ pub struct IrcWriter<'a>(&'a mut TcpStream);
 
 impl<'a> IrcWriter<'a> {
 	pub fn new(conn: &mut TcpStream) -> IrcWriter {IrcWriter(conn)}
-	pub unsafe fn write_raw(&mut self, msg: String) {
+	pub fn write_raw(&mut self, msg: String) {
 		println!("< {}", msg);
 		write!(self.0, "{}\r\n",msg).unwrap();
 	}
@@ -54,11 +54,11 @@ impl<'a> MessageContext<'a> {
 			}}
 		}
 		if clients.len() > 0 {
-			let target = clients.connect(",");
+			let target = clients.join(",");
 			conn.write_msg(Notify(TargetList::from_str(&target[..]), text));
 		}
 		if channels.len() > 0 {
-			let target = channels.connect(",");
+			let target = channels.join(",");
 			conn.write_msg(Talk(TargetList::from_str(&target[..]), text));
 		}
 	}

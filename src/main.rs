@@ -14,8 +14,8 @@
     You should have received a copy of the GNU General Public License along
     with this program; if not, write to the Free Software Foundation, Inc.,
     51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.*/
-#![feature(std_misc)]
-#![feature(core)]
+#![feature(mpsc_select)]
+#![feature(pattern)]
 extern crate irc;
 extern crate rand;
 use rand::Rng;
@@ -29,9 +29,9 @@ use std::io::prelude::*;
 use std::net;
 use std::thread;
 use std::sync::mpsc::{channel, Sender, Receiver};
-use std::str::Pattern;
 use std::sync::Arc;
 use std::collections::HashMap;
+use std::str::pattern::Pattern;
 
 macro_rules! tryopt{
 	($e:expr) => (match $e {Some(x) => x, _ => return None})
@@ -135,7 +135,7 @@ fn handle_cmd(cmd: &str, msg_ctx: MessageContext, ctx: &mut BotContext) -> bool 
 				}
 			}}
 		},
-		"streams" | "lsstream" | "lsstream" => ctx.stream_requests.send(ListAllStreams(Some(msg_ctx.get_sender_nick().to_string()))).unwrap(),
+		"streams" | "lsstream" | "lsstreams" | "liststreams" => ctx.stream_requests.send(ListAllStreams(Some(msg_ctx.get_sender_nick().to_string()))).unwrap(),
 		"addstream" | "rmstream" | "removestream" => match (verb, args.find(' ')
 				.and_then(|p| Stream::new(&args[..p], args[p..].trim_left().to_string()))) {
 			("addstream", Some(stream)) => ctx.stream_requests.send(AddStream(stream)).unwrap(),
@@ -191,16 +191,15 @@ fn on_joined(chan_list: irc::TargetList, ctx: &mut BotContext) {
 	match exchange(&mut ctx.stream_resources, None) {None => {},Some((stream_events_tx, stream_requests_rx)) => {thread::spawn(move || {
 		let mut streams: HashMap<_,_> = stream_map("twitch").into_iter().map(|name| (Twitch(name), Err("not checked yet".to_string())))
 		.chain(stream_map("hitbox").into_iter().map(|name|(Hitbox(name), Err("not checked yet".to_string())))).collect();
-		let pulse_thread = std::thread::scoped(move ||{
+		std::thread::spawn(move ||{
 			pulses.send(UpdateStreams).unwrap();
 			loop {
-				std::thread::park_timeout(std::time::Duration::seconds(10));
+				std::thread::sleep_ms(10000);
 				pulses.send(UpdateStreams).unwrap();
 			}
 		});
 		let mut client = hyper::Client::new();
 		loop {match stream_requests_rx.recv().unwrap() {UpdateStreams => {
-			println!("pulse");
 			for (stream, status) in streams.iter_mut() {
 				let new_status = stream.get_status(&mut client);
 				if new_status != *status {
@@ -269,7 +268,7 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 				};
 				// TODO: Imgur handling
 				thread::spawn(move ||{
-					let mut http = hyper::Client::new();
+					let http = hyper::Client::new();
 					match http.get(&url[..]).send()
 						.map_err(|e|format!("HTTP send error: {}", e))
 						.and_then(|mut response|{
@@ -281,7 +280,7 @@ fn handle_msg(msg: irc::IrcMessage, ctx: &mut BotContext) -> bool {
 							.and_then(|cap| cap.at(1).ok_or_else(|| "no match".to_string()))
 							.map(|title| title.to_string())) {
 						Ok(title) => tx.send(title).unwrap(),
-						Err(msg) => {}
+						Err(_) => {}
 					}
 				});
 			}
@@ -322,7 +321,7 @@ fn bot(cfg: BotConfig) {
     let mut conn = net::TcpStream::connect(&cfg.server).unwrap();
 	let conn_read = conn.try_clone().ok().unwrap();
 	let (tx, rx) = channel();
-	let irc_recv = thread::scoped(move ||{
+	let irc_recv = thread::spawn(move ||{
 		for s in irc::IrcReader::new(std::io::BufReader::new(conn_read)) {
 			match s {
 				Ok(m) => {
@@ -389,7 +388,7 @@ fn bot(cfg: BotConfig) {
 			m = joinlog_rx.recv() => ctx.conn.write_msg(irc::Talk(ctx.cfg.chan, &m.unwrap()[..]))
 		}
 	}
-	irc_recv.join();
+	irc_recv.join().unwrap();
 	println!("Disconnected");
 }
 

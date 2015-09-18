@@ -5,11 +5,11 @@ version = "0.0.1"
 authors = ["Jona Stubbe (CrystalGamma) <dev@jona-stubbe.de>"]
 
 [dependencies]
-rand = "0.2.0"
-hyper = "0.3.0"
-rustc-serialize = "0.3.7"
-chrono = "0.2.5"
-regex = "0.1.23"
+rand = "*"
+hyper = "*"
+rustc-serialize = "*"
+chrono = "*"
+regex = "*"
 
 [dependencies.irc]
 path = "../irc"
